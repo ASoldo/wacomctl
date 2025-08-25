@@ -1,3 +1,5 @@
+<img width="1249" height="694" alt="image" src="https://github.com/user-attachments/assets/2e1cfcc0-a2ee-4191-b346-6b68c623de08" />
+
 # wacomctl
 
 A simple TUI utility for inspecting and calibrating Wacom tablet pad and pen input events.
