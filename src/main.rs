@@ -12,7 +12,7 @@ use evdev::{Device, EventType, KeyCode};
 use ratatui::{
     prelude::*,
     widgets::canvas::{Canvas, Points},
-    widgets::{Block, Borders, Paragraph, Sparkline, Wrap},
+    widgets::{Block, Borders, Paragraph},
 };
 use std::{
     collections::{BTreeMap, HashMap, VecDeque},
@@ -26,10 +26,7 @@ use tokio::{sync::watch, task, time::sleep};
 // --------------------------------- constants ---------------------------------
 
 const TICK_MS: u64 = 60;
-const LOG_LINES: usize = 2000; // keep a larger scrollback
-const STRIP_HIST_CAP: usize = 60; // ~3.6s at 60ms
-const RAW_MIN: i32 = 0;
-const RAW_MAX: i32 = 4096;
+const LOG_LINES: usize = 2000;
 
 // -------------------------------- app state ----------------------------------
 
@@ -43,7 +40,7 @@ enum Side {
 enum Mode {
     Inspect,
     Calibrate,
-    Learn, // button mapping learn mode
+    Learn,
 }
 impl Default for Mode {
     fn default() -> Self {
@@ -99,10 +96,14 @@ fn cell_label(c: CellId) -> &'static str {
 #[derive(Debug, Clone, Default)]
 struct PadUi {
     pressed: BTreeMap<u16, bool>, // raw code -> down
+    // current raw values
     rx: i32,
     ry: i32,
-    rx_hist: VecDeque<i32>,
-    ry_hist: VecDeque<i32>,
+    // observed ranges (updated live)
+    rx_min: i32,
+    rx_max: i32,
+    ry_min: i32,
+    ry_max: i32,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -167,7 +168,7 @@ fn push_event_line(s: &mut UiState, line: impl Into<String>) {
         s.log.pop_front();
     }
     if at_bottom {
-        s.log_scroll = 0; // keep following new lines
+        s.log_scroll = 0;
     }
 }
 
@@ -187,10 +188,9 @@ fn load_bindings() -> HashMap<CellId, u16> {
     let p = cfg_path();
     if let Ok(bytes) = fs::read(&p) {
         if let Ok(map) = serde_json::from_slice::<HashMap<String, u16>>(&bytes) {
-            // convert "LTop" -> CellId
             let mut out = HashMap::new();
             for (k, v) in map {
-                if let Some(id) = match k.as_str() {
+                let id_opt = match k.as_str() {
                     "LTop" => Some(CellId::LTop),
                     "LTall" => Some(CellId::LTall),
                     "LMidUR" => Some(CellId::LMidUR),
@@ -202,14 +202,15 @@ fn load_bindings() -> HashMap<CellId, u16> {
                     "RMidLR" => Some(CellId::RMidLR),
                     "RBottom" => Some(CellId::RBottom),
                     _ => None,
-                } {
+                };
+                if let Some(id) = id_opt {
                     out.insert(id, v);
                 }
             }
             return out;
         }
     }
-    // default naive mapping (learn-mode will fix quickly)
+    // defaults (learn-mode will fix quickly)
     let defaults = [
         (CellId::LTop, KeyCode::BTN_0.code()),
         (CellId::LTall, KeyCode::BTN_1.code()),
@@ -337,10 +338,11 @@ async fn pad_reader(tx: watch::Sender<UiState>, rx: watch::Receiver<UiState>) {
     {
         let mut s = rx.borrow().clone();
         s.pad_name = format!("{} ({})", dev.name().unwrap_or("Wacom Pad"), path);
-        // load bindings
         s.bindings = load_bindings();
         let _ = tx.send(s);
     }
+
+    let clamp = |v: i32, lo: i32, hi: i32| v.clamp(lo, hi);
 
     loop {
         match dev.fetch_events() {
@@ -356,7 +358,6 @@ async fn pad_reader(tx: watch::Sender<UiState>, rx: watch::Receiver<UiState>) {
                             let code = ev.code();
                             s.pad.pressed.insert(code, down);
 
-                            // learn-mode: on the first DOWN for the current target, store mapping
                             if s.mode == Mode::Learn && down {
                                 if let Some(target) = CELLS.get(s.learn_stage).copied() {
                                     s.bindings.insert(target, code);
@@ -393,20 +394,27 @@ async fn pad_reader(tx: watch::Sender<UiState>, rx: watch::Receiver<UiState>) {
                         }
                         EventType::ABSOLUTE => {
                             let code = ev.code();
-                            let val = ev.value().clamp(RAW_MIN, RAW_MAX);
+                            let val = ev.value();
                             if code == 3 {
-                                s.pad.rx = val;
-                                s.pad.rx_hist.push_back(val);
-                                while s.pad.rx_hist.len() > STRIP_HIST_CAP {
-                                    s.pad.rx_hist.pop_front();
-                                }
+                                // RX
+                                // update live range tracking
+                                s.pad.rx_min = if s.pad.rx_min == 0 {
+                                    val
+                                } else {
+                                    s.pad.rx_min.min(val)
+                                };
+                                s.pad.rx_max = s.pad.rx_max.max(val);
+                                s.pad.rx = clamp(val, s.pad.rx_min, s.pad.rx_max);
                                 let _ = tx.send(s);
                             } else if code == 4 {
-                                s.pad.ry = val;
-                                s.pad.ry_hist.push_back(val);
-                                while s.pad.ry_hist.len() > STRIP_HIST_CAP {
-                                    s.pad.ry_hist.pop_front();
-                                }
+                                // RY
+                                s.pad.ry_min = if s.pad.ry_min == 0 {
+                                    val
+                                } else {
+                                    s.pad.ry_min.min(val)
+                                };
+                                s.pad.ry_max = s.pad.ry_max.max(val);
+                                s.pad.ry = clamp(val, s.pad.ry_min, s.pad.ry_max);
                                 let _ = tx.send(s);
                             }
                         }
@@ -517,22 +525,23 @@ fn start_calibration(s: &mut UiState) {
 }
 fn finish_calibration(s: &mut UiState) {
     if s.calib.points.iter().all(|p| p.done()) {
-        let p0 = &s.calib.points[0];
-        let p1 = &s.calib.points[1];
-        let p2 = &s.calib.points[2];
+        let p0 = &s.calib.points[0]; // TL
+        let p1 = &s.calib.points[1]; // TR
+        let p2 = &s.calib.points[2]; // BR
 
         let x0 = p0.raw_x.unwrap() as f32;
         let x1 = p1.raw_x.unwrap() as f32;
         let y0 = p0.raw_y.unwrap() as f32;
         let y2 = p2.raw_y.unwrap() as f32;
 
-        let raw_dx = (x1 - x0).abs().max(1.0);
-        let raw_dy = (y2 - y0).abs().max(1.0);
+        // PRESERVE SIGN so Y won't get inverted by accident.
+        let raw_dx = (x1 - x0).max(1.0e-6);
+        let raw_dy = (y2 - y0).max(1.0e-6);
 
         s.calib.scale_x = 0.8f32 / raw_dx;
         s.calib.off_x = 0.1f32 - s.calib.scale_x * x0;
 
-        s.calib.scale_y = 0.8f32 / raw_dy;
+        s.calib.scale_y = 0.8f32 / raw_dy; // may be negative -> correct orientation
         s.calib.off_y = 0.1f32 - s.calib.scale_y * y0;
 
         s.calib.solved = true;
@@ -730,7 +739,7 @@ fn draw(f: &mut Frame, s: &UiState) {
     draw_screen(f, s, main[1]);
     draw_button_cluster(f, s, Side::Right, main[2]);
 
-    // --- Events (scrollable) ---
+    // Events
     draw_events(f, s, chunks[2]);
 }
 
@@ -752,7 +761,6 @@ fn draw_events(f: &mut Frame, s: &UiState, area: Rect) {
         let off = s.log_scroll as usize;
         start = start.saturating_sub(off).min(total);
     }
-    let end = total;
 
     let mut text = String::new();
     for l in s.log.iter().skip(start).take(inner_height) {
@@ -777,31 +785,9 @@ fn draw_events(f: &mut Frame, s: &UiState, area: Rect) {
 
     let p = Paragraph::new(text);
     f.render_widget(p, inner);
-
-    // simple scrollbar
-    if total > inner_height {
-        let ratio_top = start as f64 / (total.max(1) as f64);
-        let ratio_h = (inner_height as f64) / (total as f64);
-        let sb_x = inner.x + inner.width.saturating_sub(1);
-        let sb_y = inner.y;
-        let sb_h = inner.height;
-        let thumb_h = ((sb_h as f64 * ratio_h).max(1.0)).round() as u16;
-        let thumb_y = sb_y + ((sb_h as f64 * ratio_top).round() as u16);
-
-        for i in 0..sb_h {
-            let ch = if i >= (thumb_y - sb_y) && i < (thumb_y - sb_y + thumb_h) {
-                '█'
-            } else {
-                '▕'
-            };
-            let cell = f.buffer_mut().get_mut(sb_x, sb_y + i);
-            cell.set_symbol(&ch.to_string());
-            cell.set_style(Style::default().fg(Color::DarkGray));
-        }
-    }
 }
 
-// side panel + strip sparklines
+// side panel + numeric strip readout
 fn draw_button_cluster(f: &mut Frame, s: &UiState, side: Side, area: Rect) {
     let block = Block::default()
         .borders(Borders::ALL)
@@ -818,7 +804,7 @@ fn draw_button_cluster(f: &mut Frame, s: &UiState, side: Side, area: Rect) {
         height: area.height.saturating_sub(2),
     };
 
-    // rows: top, middle, bottom, strip-history
+    // rows: top, middle, bottom, strip-value
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -842,51 +828,31 @@ fn draw_button_cluster(f: &mut Frame, s: &UiState, side: Side, area: Rect) {
         },
     );
 
-    // middle split
+    // Middle split — mirror layout: Left pad Tall on the LEFT (narrow), Right pad Tall on the RIGHT (narrow)
     let mid = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Length(12), Constraint::Min(6)])
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
         .split(rows[1]);
 
-    draw_cell(
-        f,
-        s,
-        mid[0],
-        side,
-        if matches!(side, Side::Left) {
-            CellId::LTall
-        } else {
-            CellId::RTall
-        },
-    );
-
-    let right_mid = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-        .split(mid[1]);
-
-    draw_cell(
-        f,
-        s,
-        right_mid[0],
-        side,
-        if matches!(side, Side::Left) {
-            CellId::LMidUR
-        } else {
-            CellId::RMidUR
-        },
-    );
-    draw_cell(
-        f,
-        s,
-        right_mid[1],
-        side,
-        if matches!(side, Side::Left) {
-            CellId::LMidLR
-        } else {
-            CellId::RMidLR
-        },
-    );
+    if matches!(side, Side::Left) {
+        // LEFT PAD: Tall in mid[0] (narrow), mids stacked in mid[1] (wide)
+        draw_cell(f, s, mid[0], side, CellId::LTall);
+        let pair = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+            .split(mid[1]);
+        draw_cell(f, s, pair[0], side, CellId::LMidUR);
+        draw_cell(f, s, pair[1], side, CellId::LMidLR);
+    } else {
+        // RIGHT PAD: mids stacked in mid[0] (wide), Tall in mid[1] (narrow)
+        let pair = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+            .split(mid[0]);
+        draw_cell(f, s, pair[0], side, CellId::RMidUR);
+        draw_cell(f, s, pair[1], side, CellId::RMidLR);
+        draw_cell(f, s, mid[1], side, CellId::RTall);
+    }
 
     // Bottom
     draw_cell(
@@ -901,21 +867,25 @@ fn draw_button_cluster(f: &mut Frame, s: &UiState, side: Side, area: Rect) {
         },
     );
 
-    // strip history sparkline (inverted so "bottom=highest")
-    let (hist, title) = if matches!(side, Side::Left) {
-        (&s.pad.rx_hist, "Strip RX")
+    // Strip value panel
+    let (val, mn, mx, title) = if matches!(side, Side::Left) {
+        (s.pad.rx, s.pad.rx_min, s.pad.rx_max, "Strip RX")
     } else {
-        (&s.pad.ry_hist, "Strip RY")
+        (s.pad.ry, s.pad.ry_min, s.pad.ry_max, "Strip RY")
     };
-    // normalize & invert
-    let data: Vec<u64> = hist
-        .iter()
-        .map(|&v| (RAW_MAX - v.clamp(RAW_MIN, RAW_MAX)) as u64)
-        .collect();
-    let spark = Sparkline::default()
-        .block(Block::default().borders(Borders::ALL).title(title))
-        .data(&data);
-    f.render_widget(spark, rows[3]);
+    let block = Block::default().borders(Borders::ALL).title(title);
+    f.render_widget(block, rows[3]);
+
+    let inner = Rect {
+        x: rows[3].x + 1,
+        y: rows[3].y + 1,
+        width: rows[3].width.saturating_sub(2),
+        height: rows[3].height.saturating_sub(2),
+    };
+    let span = (mx - mn).max(1) as f32;
+    let pct = ((val - mn) as f32 / span * 100.0).clamp(0.0, 100.0);
+    let txt = format!("val: {}\nmin: {}  max: {}\n({:.1}%)", val, mn, mx, pct);
+    f.render_widget(Paragraph::new(txt), inner);
 }
 
 fn draw_cell(f: &mut Frame, s: &UiState, area: Rect, _side: Side, id: CellId) {
@@ -958,17 +928,15 @@ fn draw_screen(f: &mut Frame, s: &UiState, area: Rect) {
         height: area.height.saturating_sub(2),
     };
 
-    // normalize pen to [0..1], optional affine if solved
-    let (mut nx, mut ny) = (
-        (s.pen.x - RAW_MIN) as f32 / (RAW_MAX - RAW_MIN) as f32,
-        (s.pen.y - RAW_MIN) as f32 / (RAW_MAX - RAW_MIN) as f32,
-    );
+    // normalize pen to [0..1], optional affine if solved (preserves Y sign)
+    let (mut nx, mut ny) = (s.pen.x as f32, s.pen.y as f32);
     if s.calib.solved {
-        nx = (s.calib.scale_x * s.pen.x as f32 + s.calib.off_x).clamp(0.0, 1.0);
-        ny = (s.calib.scale_y * s.pen.y as f32 + s.calib.off_y).clamp(0.0, 1.0);
+        nx = (s.calib.scale_x * nx + s.calib.off_x).clamp(0.0, 1.0);
+        ny = (s.calib.scale_y * ny + s.calib.off_y).clamp(0.0, 1.0);
     } else {
-        nx = nx.clamp(0.0, 1.0);
-        ny = ny.clamp(0.0, 1.0);
+        // rough guess to keep visible before calibration
+        nx = (nx / 4096.0).clamp(0.0, 1.0);
+        ny = (ny / 4096.0).clamp(0.0, 1.0);
     }
 
     let canvas = Canvas::default()
