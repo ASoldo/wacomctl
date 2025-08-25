@@ -913,9 +913,9 @@ fn draw_cell(f: &mut Frame, s: &UiState, area: Rect, _side: Side, id: CellId) {
         .unwrap_or(false);
 
     let ttl = if let Some(c) = code {
-        format!("{}  (code {})", cell_label(id), c)
+        format!("{}:{}", cell_label(id), c)
     } else {
-        format!("{}  (unmapped)", cell_label(id))
+        format!("{}:(unmapped)", cell_label(id))
     };
 
     let block = Block::default()
