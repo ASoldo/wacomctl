@@ -18,6 +18,12 @@ cargo run --release
 
 Replace `event29` and `event28` with the actual event numbers for your system.
 
+## Set Permissions
+```sh
+sudo setfacl -m u:rootster:rw- /dev/input/event28
+sudo setfacl -m u:rootster:rw- /dev/input/event29
+```
+
 ## Features
 
 * Displays button states for pad buttons.
