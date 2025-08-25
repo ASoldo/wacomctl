@@ -1,4 +1,5 @@
-<img width="1249" height="694" alt="image" src="https://github.com/user-attachments/assets/2e1cfcc0-a2ee-4191-b346-6b68c623de08" />
+<img width="2" height="1" alt="image" src="https://github.com/user-attachments/assets/8fcf0a46-bd74-4951-957a-2725f1b95c17" />
+
 
 # wacomctl
 
