@@ -161,6 +161,23 @@ struct UiState {
 
 // ------------------------------- small helpers -------------------------------
 
+fn norm_preview(v: i32, samples: impl Iterator<Item = i32>) -> f32 {
+    let mut min = i32::MAX;
+    let mut max = i32::MIN;
+    let mut count = 0;
+    for s in samples {
+        min = min.min(s);
+        max = max.max(s);
+        count += 1;
+    }
+    if count >= 2 && max > min {
+        ((v - min) as f32 / (max - min) as f32).clamp(0.0, 1.0)
+    } else {
+        // before we have 2 samples, keep a very wide fallback so it still moves
+        (v as f32 / 65535.0).clamp(0.0, 1.0)
+    }
+}
+
 fn push_event_line(s: &mut UiState, line: impl Into<String>) {
     let at_bottom = s.log_scroll == 0;
     s.log.push_back(line.into());
@@ -930,14 +947,23 @@ fn draw_screen(f: &mut Frame, s: &UiState, area: Rect) {
 
     // normalize pen to [0..1], optional affine if solved (preserves Y sign)
     let (mut nx, mut ny) = (s.pen.x as f32, s.pen.y as f32);
+
     if s.calib.solved {
         nx = (s.calib.scale_x * nx + s.calib.off_x).clamp(0.0, 1.0);
         ny = (s.calib.scale_y * ny + s.calib.off_y).clamp(0.0, 1.0);
+    } else if s.calib.active {
+        // use captured raw points so far for live preview scaling
+        let xs = s.calib.points.iter().filter_map(|p| p.raw_x);
+        let ys = s.calib.points.iter().filter_map(|p| p.raw_y);
+        nx = norm_preview(s.pen.x, xs);
+        ny = norm_preview(s.pen.y, ys);
     } else {
-        // rough guess to keep visible before calibration
-        nx = (nx / 4096.0).clamp(0.0, 1.0);
-        ny = (ny / 4096.0).clamp(0.0, 1.0);
+        // non-calibration fallback (very wide range so it won’t clamp immediately)
+        nx = (nx / 65535.0).clamp(0.0, 1.0);
+        ny = (ny / 65535.0).clamp(0.0, 1.0);
     }
+
+    ny = 1.0 - ny;
 
     let canvas = Canvas::default()
         .x_bounds([0.0, 1.0])
